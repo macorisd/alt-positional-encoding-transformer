@@ -36,9 +36,11 @@ model = Transformer(src_pad_idx=src_pad_idx,
                     n_head=n_heads,
                     n_layers=n_layers,
                     drop_prob=drop_prob,
-                    device=device).to(device)
+                    device=device,
+                    periodic_func=periodic_func).to(device)
 
 print(f'The model has {count_parameters(model):,} trainable parameters')
+print(f'Using positional encoding: {periodic_func}')
 model.apply(initialize_weights)
 optimizer = Adam(params=model.parameters(),
                  lr=init_lr,

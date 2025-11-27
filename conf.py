@@ -27,3 +27,7 @@ epoch = 1000
 clip = 1.0
 weight_decay = 5e-4
 inf = float('inf')
+
+# positional encoding setting
+# Options: 'sinusoid', 'square', 'sawtooth'
+periodic_func = 'sinusoid'

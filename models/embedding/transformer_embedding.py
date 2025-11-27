@@ -11,20 +11,21 @@ from models.embedding.token_embeddings import TokenEmbedding
 
 class TransformerEmbedding(nn.Module):
     """
-    token embedding + positional encoding (sinusoid)
+    token embedding + positional encoding
     positional encoding can give positional information to network
     """
 
-    def __init__(self, vocab_size, d_model, max_len, drop_prob, device):
+    def __init__(self, vocab_size, d_model, max_len, drop_prob, device, periodic_func='sinusoid'):
         """
         class for word embedding that included positional information
 
         :param vocab_size: size of vocabulary
         :param d_model: dimensions of model
+        :param periodic_func: type of periodic function for positional encoding
         """
         super(TransformerEmbedding, self).__init__()
         self.tok_emb = TokenEmbedding(vocab_size, d_model)
-        self.pos_emb = PositionalEncoding(d_model, max_len, device)
+        self.pos_emb = PositionalEncoding(d_model, max_len, device, periodic_func)
         self.drop_out = nn.Dropout(p=drop_prob)
 
     def forward(self, x):
