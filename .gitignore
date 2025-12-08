@@ -3,4 +3,4 @@ venv/
 *.pt
 __pycache__/
 
-result/
+result*/
