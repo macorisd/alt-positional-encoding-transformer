@@ -29,5 +29,5 @@ weight_decay = 5e-4
 inf = float('inf')
 
 # positional encoding setting
-# Options: 'sinusoid', 'square', 'sawtooth'
-periodic_func = 'sinusoid'
+# Options: 'sinusoid', 'triangular', 'square', 'sawtooth'
+periodic_func = 'triangular'
