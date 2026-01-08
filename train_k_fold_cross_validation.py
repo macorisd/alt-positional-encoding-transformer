@@ -4,8 +4,23 @@ Script to run 10-fold Cross Validation with different periodic functions
 for Positional Encoding in the Transformer.
 
 Usage:
-    python test.py            # Start new cross-validation
-    python test.py --resume   # Resume from most recent results directory
+    python train_k_fold_cross_validation.py
+        Start new cross-validation with all functions (uses device from conf.py)
+    
+    python train_k_fold_cross_validation.py --resume
+        Resume from most recent results directory
+    
+    python train_k_fold_cross_validation.py --functions sinusoid,triangular --device cuda:0
+        Train only specific functions on specific GPU
+    
+    python train_k_fold_cross_validation.py --functions square,sawtooth --device cuda:1
+        Train different functions on different GPU (for parallel execution)
+
+Arguments:
+    --resume            Resume from most recent results directory
+    --functions STR     Comma-separated periodic functions (default: sinusoid,triangular,square,sawtooth)
+    --device STR        Device override (e.g., cuda:0, cuda:1). Overrides conf.py
+    --bleu-every INT    Calculate BLEU every N epochs (default: 25). Set to 1 for every epoch.
 """
 
 import os
@@ -24,7 +39,7 @@ from conf import *
 from util.data_loader import DataLoader
 from util.tokenizer import Tokenizer
 from models.model.transformer import Transformer
-from util.bleu import idx_to_word, get_bleu
+from util.bleu import evaluate_bleu
 from util.epoch_timer import epoch_time
 
 
@@ -147,12 +162,19 @@ def train_epoch(model, iterator, optimizer, criterion, clip):
     return epoch_loss / len(iterator)
 
 
-def evaluate(model, iterator, criterion, loader):
-    """Evaluate the model"""
+def evaluate(model, iterator, criterion, loader, device, val_data, compute_bleu=True):
+    """
+    Evaluate model computing loss and optionally BLEU score.
+    Uses autoregressive generation for BLEU calculation.
+    
+    Args:
+        compute_bleu: If False, skip BLEU calculation and return None
+        val_data: Validation data for creating BLEU iterator with smaller batch size
+    """
     model.eval()
     epoch_loss = 0
-    batch_bleu = []
     
+    # Calculate loss with teacher forcing (uses training batch_size)
     with torch.no_grad():
         for i, batch in enumerate(iterator):
             src, trg = batch
@@ -163,28 +185,43 @@ def evaluate(model, iterator, criterion, loader):
 
             loss = criterion(output_reshape, trg_flat)
             epoch_loss += loss.item()
+    
+    # Calculate BLEU with autoregressive generation (uses smaller batch_size)
+    bleu_score = None
+    if compute_bleu:
+        print(f'  Computing BLEU with autoregressive generation (batch_size={batch_size})...')
+        
+        # Create new iterator with batch size for BLEU
+        _, bleu_iter, _ = loader.make_iter(val_data, val_data, val_data,
+                                           batch_size=batch_size,
+                                           device=device)
+        
+        sos_idx = loader.target.vocab['<sos>']
+        eos_idx = loader.target.vocab['<eos>']
+        pad_idx = loader.target.vocab['<pad>']
+        
+        bleu_score = evaluate_bleu(
+            model=model,
+            iterator=bleu_iter,
+            vocab_target=loader.target,
+            max_len=max_len,
+            sos_idx=sos_idx,
+            eos_idx=eos_idx,
+            pad_idx=pad_idx,
+            device=device
+        )
+    
+    return epoch_loss / len(iterator), bleu_score
 
-            total_bleu = []
-            for j in range(trg.shape[0]):
-                try:
-                    trg_words = idx_to_word(trg[j], loader.target)
-                    output_words = output[j].max(dim=1)[1]
-                    output_words = idx_to_word(output_words, loader.target)
-                    bleu = get_bleu(hypotheses=output_words.split(), reference=trg_words.split())
-                    total_bleu.append(bleu)
-                except:
-                    pass
 
-            if total_bleu:
-                avg_bleu = sum(total_bleu) / len(total_bleu)
-                batch_bleu.append(avg_bleu)
-
-    batch_bleu_score = sum(batch_bleu) / len(batch_bleu) if batch_bleu else 0
-    return epoch_loss / len(iterator), batch_bleu_score
-
-
-def run_training(model, train_iter, valid_iter, loader, output_dir, total_epochs, device):
-    """Run complete training"""
+def run_training(model, train_iter, valid_iter, loader, val_data, output_dir, total_epochs, device, periodic_func, fold_info, bleu_every=25):
+    """
+    Run complete training.
+    
+    Args:
+        periodic_func: Name of periodic function (e.g., 'sinusoid')
+        fold_info: String like 'Fold 1/10'
+    """
     optimizer = Adam(params=model.parameters(),
                     lr=init_lr,
                     weight_decay=weight_decay,
@@ -204,7 +241,10 @@ def run_training(model, train_iter, valid_iter, loader, output_dir, total_epochs
         start_time = time.time()
         
         train_loss = train_epoch(model, train_iter, optimizer, criterion, clip)
-        valid_loss, bleu = evaluate(model, valid_iter, criterion, loader)
+        
+        # Calculate BLEU only every N epochs or on last epoch
+        compute_bleu = (epoch + 1) % bleu_every == 0 or epoch == total_epochs - 1
+        valid_loss, bleu = evaluate(model, valid_iter, criterion, loader, device, val_data, compute_bleu=compute_bleu)
         
         end_time = time.time()
         
@@ -213,7 +253,7 @@ def run_training(model, train_iter, valid_iter, loader, output_dir, total_epochs
         
         train_losses.append(train_loss)
         test_losses.append(valid_loss)
-        bleus.append(bleu)
+        bleus.append(bleu)  # Append None if not calculated, or the actual value
         
         epoch_mins, epoch_secs = epoch_time(start_time, end_time)
         
@@ -232,10 +272,13 @@ def run_training(model, train_iter, valid_iter, loader, output_dir, total_epochs
         with open(os.path.join(output_dir, 'bleu.txt'), 'w') as f:
             f.write(str(bleus))
         
-        print(f'Epoch {epoch+1}/{total_epochs} | Time: {epoch_mins}m {epoch_secs}s')
+        print(f'[{periodic_func} | {fold_info}] Epoch {epoch+1}/{total_epochs} | Time: {epoch_mins}m {epoch_secs}s')
         print(f'  Train Loss: {train_loss:.3f} | Train PPL: {math.exp(train_loss):7.3f}')
         print(f'  Val Loss: {valid_loss:.3f} | Val PPL: {math.exp(valid_loss):7.3f}')
-        print(f'  BLEU Score: {bleu:.3f}')
+        if bleu is not None:
+            print(f'  BLEU Score: {bleu:.3f}')
+        else:
+            print(f'  BLEU Score: (skipped, calculated every {bleu_every} epochs)')
     
     # Save best model at the end of training
     if best_model_state is not None:
@@ -246,7 +289,7 @@ def run_training(model, train_iter, valid_iter, loader, output_dir, total_epochs
     return train_losses, test_losses, bleus
 
 
-def run_cross_validation(periodic_func, loader, folds, base_output_dir, total_epochs=1000, start_fold=0):
+def run_cross_validation(periodic_func, loader, folds, base_output_dir, total_epochs=1000, start_fold=0, bleu_every=25):
     """Run cross validation for a specific periodic function"""
     func_dir = os.path.join(base_output_dir, periodic_func)
     os.makedirs(func_dir, exist_ok=True)
@@ -273,13 +316,15 @@ def run_cross_validation(periodic_func, loader, folds, base_output_dir, total_ep
                     with open(os.path.join(fold_dir, 'bleu.txt'), 'r') as f:
                         bleus = eval(f.read())
                     
+                    # Filter out None values from bleus before finding max
+                    valid_bleus = [b for b in bleus if b is not None]
                     fold_stats = {
                         'fold': prev_fold_idx + 1,
                         'final_train_loss': train_losses[-1],
                         'final_val_loss': test_losses[-1],
                         'final_bleu': bleus[-1],
                         'best_val_loss': min(test_losses),
-                        'best_bleu': max(bleus)
+                        'best_bleu': max(valid_bleus) if valid_bleus else 0.0
                     }
                     all_results.append(fold_stats)
                     print(f"Loaded existing results for Fold {prev_fold_idx + 1}")
@@ -326,18 +371,22 @@ def run_cross_validation(periodic_func, loader, folds, base_output_dir, total_ep
         print(f"Validation samples: {len(val_data)}\n")
         
         # Train
+        fold_info = f'Fold {fold_idx + 1}/{len(folds)}'
         train_losses, test_losses, bleus = run_training(
-            model, train_iter, val_iter, loader, fold_dir, total_epochs, device
+            model, train_iter, val_iter, loader, val_data, fold_dir, total_epochs, device, 
+            periodic_func=periodic_func, fold_info=fold_info, bleu_every=bleu_every
         )
         
         # Save fold statistics
+        # Filter out None values from bleus before finding max
+        valid_bleus = [b for b in bleus if b is not None]
         fold_stats = {
             'fold': fold_idx + 1,
             'final_train_loss': train_losses[-1],
             'final_val_loss': test_losses[-1],
             'final_bleu': bleus[-1],
             'best_val_loss': min(test_losses),
-            'best_bleu': max(bleus)
+            'best_bleu': max(valid_bleus) if valid_bleus else 0.0
         }
         all_results.append(fold_stats)
         
@@ -389,12 +438,26 @@ def main():
     parser = argparse.ArgumentParser(description='10-fold Cross Validation for Transformer')
     parser.add_argument('--resume', action='store_true',
                        help='Resume from most recent results directory')
+    parser.add_argument('--functions', type=str, default='sinusoid,triangular,square,sawtooth',
+                       help='Comma-separated list of periodic functions (default: all)')
+    parser.add_argument('--device', type=str, default=None,
+                       help='Device to use (e.g., cuda:0, cuda:1). Overrides conf.py')
+    parser.add_argument('--bleu-every', type=int, default=25,
+                       help='Calculate BLEU every N epochs (default: 25). Set to 1 for every epoch.')
     args = parser.parse_args()
     
     # Configuration
-    periodic_functions = ['sinusoid', 'triangular', 'square', 'sawtooth']
+    periodic_functions = [f.strip() for f in args.functions.split(',')]
     k_folds = 10
     epochs_per_fold = 1000
+    
+    # Set device (CLI argument overrides conf.py)
+    global device
+    if args.device:
+        device = torch.device(args.device)
+        print(f"Using device from CLI: {device}")
+    else:
+        print(f"Using device from conf.py: {device}")
     
     # Determine base directory and resume point
     if args.resume:
@@ -460,7 +523,7 @@ def main():
         start_fold = resume_fold if idx == 0 and resume_function == periodic_func else 0
         
         results = run_cross_validation(
-            periodic_func, loader, folds, base_dir, epochs_per_fold, start_fold=start_fold
+            periodic_func, loader, folds, base_dir, epochs_per_fold, start_fold=start_fold, bleu_every=args.bleu_every
         )
         all_function_results[periodic_func] = results
     

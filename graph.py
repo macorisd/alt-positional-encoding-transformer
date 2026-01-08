@@ -18,14 +18,23 @@ plt.rcParams["pdf.fonttype"] = "truetype"
 
 def read(name):
     """
-    Reads a text file with comma-separated values and returns a list of floats.
+    Reads a text file with comma-separated values and returns a list of floats or None values.
     """
     try:
         with open(name, 'r') as f:
             file = f.read()
             file = re.sub('\\[', '', file)
             file = re.sub('\\]', '', file)
-            return [float(i) for idx, i in enumerate(file.split(',')) if i.strip()]
+            result = []
+            for i in file.split(','):
+                stripped = i.strip()
+                if not stripped:
+                    continue
+                if stripped == 'None':
+                    result.append(None)
+                else:
+                    result.append(float(stripped))
+            return result
     except Exception as e:
         print(f"Error reading {name}: {e}")
         return []
@@ -53,10 +62,20 @@ def draw_loss(train_data, test_data, save_path, title='Training and Validation L
 def draw_bleu(bleu_data, save_path, title='BLEU Score'):
     """
     Generates BLEU score graph.
+    Handles None values for epochs where BLEU was not calculated.
     """
     plt.figure(figsize=(10, 6))
-    epochs = range(1, len(bleu_data) + 1)
-    plt.plot(epochs, bleu_data, 'g-', label='BLEU Score', linewidth=2)
+    
+    # Filter out None values and keep track of corresponding epochs
+    epochs_with_bleu = [i + 1 for i, b in enumerate(bleu_data) if b is not None]
+    bleu_values = [b for b in bleu_data if b is not None]
+    
+    if not bleu_values:
+        print(f"  Warning: No BLEU values to plot in {save_path}")
+        plt.close()
+        return
+    
+    plt.plot(epochs_with_bleu, bleu_values, 'go-', label='BLEU Score', linewidth=2, markersize=4)
     plt.xlabel('Epoch', fontsize=12)
     plt.ylabel('BLEU Score', fontsize=12)
     plt.title(title, fontsize=14)
@@ -157,7 +176,15 @@ def process_wave(wave_path):
         # Generate average BLEU graph
         if not bleu_avg_graph.exists() and all_bleu_scores:
             min_len = min(len(lst) for lst in all_bleu_scores)
-            bleu_avg = np.mean([lst[:min_len] for lst in all_bleu_scores], axis=0)
+            # Average BLEU, handling None values
+            bleu_lists = [lst[:min_len] for lst in all_bleu_scores]
+            bleu_avg = []
+            for i in range(min_len):
+                epoch_values = [lst[i] for lst in bleu_lists if lst[i] is not None]
+                if epoch_values:
+                    bleu_avg.append(np.mean(epoch_values))
+                else:
+                    bleu_avg.append(None)
             
             draw_bleu(bleu_avg, str(bleu_avg_graph),
                      title=f'Average BLEU Score - {wave_name} ({len(fold_dirs)} folds)')
@@ -293,7 +320,16 @@ def create_consolidated_graphs(results_base_path):
         
         if all_bleu_scores:
             min_len = min(len(lst) for lst in all_bleu_scores)
-            waves_data[wave_name]['bleu_scores'] = np.mean([lst[:min_len] for lst in all_bleu_scores], axis=0)
+            # Average BLEU, handling None values
+            bleu_lists = [lst[:min_len] for lst in all_bleu_scores]
+            bleu_avg = []
+            for i in range(min_len):
+                epoch_values = [lst[i] for lst in bleu_lists if lst[i] is not None]
+                if epoch_values:
+                    bleu_avg.append(np.mean(epoch_values))
+                else:
+                    bleu_avg.append(None)
+            waves_data[wave_name]['bleu_scores'] = bleu_avg
     
     # Generate BLEU graph
     plt.figure(figsize=(10, 6))
@@ -301,9 +337,13 @@ def create_consolidated_graphs(results_base_path):
     for wave_name, color in zip(wave_names, colors):
         bleu_data = waves_data[wave_name]['bleu_scores']
         if len(bleu_data) > 0:
-            epochs = range(1, len(bleu_data) + 1)
-            plt.plot(epochs, bleu_data, color=color, linestyle='-', 
-                    label=wave_name.capitalize(), linewidth=2)
+            # Filter out None values and keep track of corresponding epochs
+            epochs_with_bleu = [i + 1 for i, b in enumerate(bleu_data) if b is not None]
+            bleu_values = [b for b in bleu_data if b is not None]
+            
+            if bleu_values:  # Only plot if there are valid values
+                plt.plot(epochs_with_bleu, bleu_values, color=color, linestyle='-', 
+                        label=wave_name.capitalize(), linewidth=2)
     
     plt.xlabel('Epoch', fontsize=12)
     plt.ylabel('BLEU Score', fontsize=12)
