@@ -84,6 +84,34 @@ def find_resume_point(results_dir, periodic_functions, k_folds=10):
     return None, None
 
 
+def get_incomplete_folds(results_dir, periodic_func, k_folds=10):
+    """
+    Get list of folds that need to be executed for a specific periodic function.
+    Cleans up incomplete fold directories (those without model_best.pt).
+    Returns: list of fold indices (0-based) that need to be executed, or None if all complete
+    """
+    func_dir = os.path.join(results_dir, periodic_func)
+    
+    if not os.path.exists(func_dir):
+        # This function hasn't been started yet - need to run all folds
+        return list(range(k_folds))
+    
+    incomplete_folds = []
+    for fold_idx in range(k_folds):
+        fold_dir = os.path.join(func_dir, f'{periodic_func}_{fold_idx + 1}')
+        model_path = os.path.join(fold_dir, 'model_best.pt')
+        
+        if not os.path.exists(model_path):
+            # This fold is incomplete
+            if os.path.exists(fold_dir):
+                print(f"Removing incomplete fold: {fold_dir}")
+                shutil.rmtree(fold_dir)
+            incomplete_folds.append(fold_idx)
+    
+    # Return None if all complete, otherwise return list of incomplete folds
+    return None if len(incomplete_folds) == 0 else incomplete_folds
+
+
 def count_parameters(model):
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
@@ -289,25 +317,33 @@ def run_training(model, train_iter, valid_iter, loader, val_data, output_dir, to
     return train_losses, test_losses, bleus
 
 
-def run_cross_validation(periodic_func, loader, folds, base_output_dir, total_epochs=1000, start_fold=0, bleu_every=25):
-    """Run cross validation for a specific periodic function"""
+def run_cross_validation(periodic_func, loader, folds, base_output_dir, total_epochs=1000, folds_to_run=None, bleu_every=25):
+    """
+    Run cross validation for a specific periodic function
+    
+    Args:
+        folds_to_run: List of fold indices (0-based) to execute. If None, runs all folds.
+    """
     func_dir = os.path.join(base_output_dir, periodic_func)
     os.makedirs(func_dir, exist_ok=True)
     
     print(f"\n{'='*80}")
     print(f"CROSS VALIDATION: {periodic_func}")
-    if start_fold > 0:
-        print(f"RESUMING FROM FOLD {start_fold + 1}")
+    if folds_to_run is not None and len(folds_to_run) < len(folds):
+        print(f"EXECUTING FOLDS: {[f+1 for f in folds_to_run]} (skipping completed folds)")
     print(f"{'='*80}\n")
     
-    # Load existing results if resuming
+    # Determine which folds to execute
+    if folds_to_run is None:
+        folds_to_run = list(range(len(folds)))
+    
+    # Load existing results from completed folds
     all_results = []
-    if start_fold > 0:
-        # Load stats from completed folds
-        for prev_fold_idx in range(start_fold):
-            fold_dir = os.path.join(func_dir, f'{periodic_func}_{prev_fold_idx + 1}')
+    for fold_idx in range(len(folds)):
+        if fold_idx not in folds_to_run:
+            # This fold is already complete, load its results
+            fold_dir = os.path.join(func_dir, f'{periodic_func}_{fold_idx + 1}')
             if os.path.exists(fold_dir):
-                # Try to reconstruct stats from saved files
                 try:
                     with open(os.path.join(fold_dir, 'train_loss.txt'), 'r') as f:
                         train_losses = eval(f.read())
@@ -319,7 +355,7 @@ def run_cross_validation(periodic_func, loader, folds, base_output_dir, total_ep
                     # Filter out None values from bleus before finding max
                     valid_bleus = [b for b in bleus if b is not None]
                     fold_stats = {
-                        'fold': prev_fold_idx + 1,
+                        'fold': fold_idx + 1,
                         'final_train_loss': train_losses[-1],
                         'final_val_loss': test_losses[-1],
                         'final_bleu': bleus[-1],
@@ -327,11 +363,12 @@ def run_cross_validation(periodic_func, loader, folds, base_output_dir, total_ep
                         'best_bleu': max(valid_bleus) if valid_bleus else 0.0
                     }
                     all_results.append(fold_stats)
-                    print(f"Loaded existing results for Fold {prev_fold_idx + 1}")
+                    print(f"Loaded existing results for Fold {fold_idx + 1}")
                 except:
-                    print(f"Warning: Could not load results for Fold {prev_fold_idx + 1}")
+                    print(f"Warning: Could not load results for Fold {fold_idx + 1}")
     
-    for fold_idx in range(start_fold, len(folds)):
+    # Execute incomplete folds
+    for fold_idx in folds_to_run:
         print(f"\n{'-'*80}")
         print(f"Fold {fold_idx + 1}/{len(folds)}")
         print(f"{'-'*80}")
@@ -438,8 +475,8 @@ def main():
     parser = argparse.ArgumentParser(description='10-fold Cross Validation for Transformer')
     parser.add_argument('--resume', action='store_true',
                        help='Resume from most recent results directory')
-    parser.add_argument('--functions', type=str, default='sinusoid,triangular,square,sawtooth',
-                       help='Comma-separated list of periodic functions (default: all)')
+    parser.add_argument('--functions', type=str, default=None,
+                       help='Comma-separated list of periodic functions (default: all available or detect from existing)')
     parser.add_argument('--device', type=str, default=None,
                        help='Device to use (e.g., cuda:0, cuda:1). Overrides conf.py')
     parser.add_argument('--bleu-every', type=int, default=25,
@@ -447,9 +484,15 @@ def main():
     args = parser.parse_args()
     
     # Configuration
-    periodic_functions = [f.strip() for f in args.functions.split(',')]
     k_folds = 10
     epochs_per_fold = 1000
+    
+    # Determine periodic functions to use
+    if args.functions:
+        periodic_functions = [f.strip() for f in args.functions.split(',')]
+    else:
+        # Default list of functions
+        periodic_functions = ['sinusoid', 'triangular', 'square', 'sawtooth']
     
     # Set device (CLI argument overrides conf.py)
     global device
@@ -467,24 +510,41 @@ def main():
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             base_dir = f'/home/ubuntu/Desktop/GitHub/transformer-translation/results/results_{timestamp}'
             os.makedirs(base_dir, exist_ok=True)
-            resume_function = None
-            resume_fold = 0
         else:
             print(f"Found previous results: {base_dir}")
-            resume_function, resume_fold = find_resume_point(base_dir, periodic_functions, k_folds)
             
-            if resume_function is None:
+            # If --functions not specified, detect which functions exist in the results directory
+            if not args.functions:
+                existing_funcs = []
+                for func in periodic_functions:
+                    func_dir = os.path.join(base_dir, func)
+                    if os.path.exists(func_dir):
+                        existing_funcs.append(func)
+                
+                if existing_funcs:
+                    periodic_functions = existing_funcs
+                    print(f"Detected existing functions to resume: {', '.join(periodic_functions)}")
+                else:
+                    print(f"No existing functions found, will start with default: {', '.join(periodic_functions)}")
+            
+            # Check if all training already completed
+            all_complete = True
+            for periodic_func in periodic_functions:
+                incomplete_folds = get_incomplete_folds(base_dir, periodic_func, k_folds)
+                if incomplete_folds is not None:
+                    all_complete = False
+                    break
+            
+            if all_complete:
                 print("All training already completed!")
                 return
             
-            print(f"Resuming from: {resume_function}, fold {resume_fold + 1}")
+            print(f"Will check resume point for each function individually...")
     else:
         # Create new base directory with timestamp
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         base_dir = f'/home/ubuntu/Desktop/GitHub/transformer-translation/results/results_{timestamp}'
         os.makedirs(base_dir, exist_ok=True)
-        resume_function = None
-        resume_fold = 0
     
     print(f"\n{'#'*80}")
     print(f"# 10-FOLD CROSS VALIDATION - POSITIONAL ENCODING COMPARISON")
@@ -493,8 +553,8 @@ def main():
     print(f"# K-folds: {k_folds}")
     print(f"# Epochs per fold: {epochs_per_fold}")
     print(f"# Periodic functions: {', '.join(periodic_functions)}")
-    if args.resume and resume_function:
-        print(f"# RESUMING: {resume_function} from fold {resume_fold + 1}")
+    if args.resume:
+        print(f"# RESUME MODE: Will check each function individually")
     print(f"{'#'*80}\n")
     
     # Prepare data
@@ -511,21 +571,61 @@ def main():
     # Run cross validation for each periodic function
     all_function_results = {}
     
-    # Determine which functions to run
-    if resume_function:
-        func_start_idx = periodic_functions.index(resume_function)
-        functions_to_run = periodic_functions[func_start_idx:]
+    # If resuming, process each function individually
+    if args.resume:
+        for periodic_func in periodic_functions:
+            # Check which folds need to be executed for this function
+            folds_to_run = get_incomplete_folds(base_dir, periodic_func, k_folds)
+            
+            if folds_to_run is None:
+                print(f"\n{'='*80}")
+                print(f"SKIPPING {periodic_func}: All folds already completed")
+                print(f"{'='*80}\n")
+                
+                # Load existing results for summary
+                func_dir = os.path.join(base_dir, periodic_func)
+                all_results = []
+                for fold_idx in range(k_folds):
+                    fold_dir = os.path.join(func_dir, f'{periodic_func}_{fold_idx + 1}')
+                    if os.path.exists(fold_dir):
+                        try:
+                            with open(os.path.join(fold_dir, 'train_loss.txt'), 'r') as f:
+                                train_losses = eval(f.read())
+                            with open(os.path.join(fold_dir, 'test_loss.txt'), 'r') as f:
+                                test_losses = eval(f.read())
+                            with open(os.path.join(fold_dir, 'bleu.txt'), 'r') as f:
+                                bleus = eval(f.read())
+                            
+                            valid_bleus = [b for b in bleus if b is not None]
+                            fold_stats = {
+                                'fold': fold_idx + 1,
+                                'final_train_loss': train_losses[-1],
+                                'final_val_loss': test_losses[-1],
+                                'final_bleu': bleus[-1],
+                                'best_val_loss': min(test_losses),
+                                'best_bleu': max(valid_bleus) if valid_bleus else 0.0
+                            }
+                            all_results.append(fold_stats)
+                        except:
+                            pass
+                all_function_results[periodic_func] = all_results
+                continue
+            
+            print(f"\n{'='*80}")
+            print(f"PROCESSING {periodic_func}: Executing folds {[f+1 for f in folds_to_run]}")
+            print(f"{'='*80}\n")
+            
+            results = run_cross_validation(
+                periodic_func, loader, folds, base_dir, epochs_per_fold, folds_to_run=folds_to_run, bleu_every=args.bleu_every
+            )
+            all_function_results[periodic_func] = results
     else:
-        functions_to_run = periodic_functions
-    
-    for idx, periodic_func in enumerate(functions_to_run):
-        # Only use resume_fold for the first function when resuming
-        start_fold = resume_fold if idx == 0 and resume_function == periodic_func else 0
-        
-        results = run_cross_validation(
-            periodic_func, loader, folds, base_dir, epochs_per_fold, start_fold=start_fold, bleu_every=args.bleu_every
-        )
-        all_function_results[periodic_func] = results
+        # New training, process all functions from the beginning
+        for periodic_func in periodic_functions:
+            results = run_cross_validation(
+                periodic_func, loader, folds, base_dir, epochs_per_fold, folds_to_run=None, bleu_every=args.bleu_every
+            )
+            all_function_results[periodic_func] = results
     
     # Create global summary
     global_summary_path = os.path.join(base_dir, 'global_summary.txt')
