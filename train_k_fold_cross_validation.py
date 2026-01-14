@@ -21,6 +21,7 @@ Arguments:
     --functions STR     Comma-separated periodic functions (default: sinusoid,triangular,square,sawtooth)
     --device STR        Device override (e.g., cuda:0, cuda:1). Overrides conf.py
     --bleu-every INT    Calculate BLEU every N epochs (default: 25). Set to 1 for every epoch.
+    --save-every INT    Save losses and BLEU to files every N epochs (default: 25). Values are retained in memory.
 """
 
 import os
@@ -242,13 +243,14 @@ def evaluate(model, iterator, criterion, loader, device, val_data, compute_bleu=
     return epoch_loss / len(iterator), bleu_score
 
 
-def run_training(model, train_iter, valid_iter, loader, val_data, output_dir, total_epochs, device, periodic_func, fold_info, bleu_every=25):
+def run_training(model, train_iter, valid_iter, loader, val_data, output_dir, total_epochs, device, periodic_func, fold_info, bleu_every=25, save_every=25):
     """
     Run complete training.
     
     Args:
         periodic_func: Name of periodic function (e.g., 'sinusoid')
         fold_info: String like 'Fold 1/10'
+        save_every: Save losses and BLEU to files every N epochs (default: 25)
     """
     optimizer = Adam(params=model.parameters(),
                     lr=init_lr,
@@ -290,15 +292,16 @@ def run_training(model, train_iter, valid_iter, loader, val_data, output_dir, to
             best_loss = valid_loss
             best_model_state = model.state_dict().copy()
         
-        # Save results after each epoch
-        with open(os.path.join(output_dir, 'train_loss.txt'), 'w') as f:
-            f.write(str(train_losses))
-        
-        with open(os.path.join(output_dir, 'test_loss.txt'), 'w') as f:
-            f.write(str(test_losses))
-        
-        with open(os.path.join(output_dir, 'bleu.txt'), 'w') as f:
-            f.write(str(bleus))
+        # Save results every save_every epochs or on last epoch
+        if (epoch + 1) % save_every == 0 or epoch == total_epochs - 1:
+            with open(os.path.join(output_dir, 'train_loss.txt'), 'w') as f:
+                f.write(str(train_losses))
+            
+            with open(os.path.join(output_dir, 'test_loss.txt'), 'w') as f:
+                f.write(str(test_losses))
+            
+            with open(os.path.join(output_dir, 'bleu.txt'), 'w') as f:
+                f.write(str(bleus))
         
         print(f'[{periodic_func} | {fold_info}] Epoch {epoch+1}/{total_epochs} | Time: {epoch_mins}m {epoch_secs}s')
         print(f'  Train Loss: {train_loss:.3f} | Train PPL: {math.exp(train_loss):7.3f}')
@@ -317,12 +320,13 @@ def run_training(model, train_iter, valid_iter, loader, val_data, output_dir, to
     return train_losses, test_losses, bleus
 
 
-def run_cross_validation(periodic_func, loader, folds, base_output_dir, total_epochs=1000, folds_to_run=None, bleu_every=25):
+def run_cross_validation(periodic_func, loader, folds, base_output_dir, total_epochs=1000, folds_to_run=None, bleu_every=25, save_every=25):
     """
     Run cross validation for a specific periodic function
     
     Args:
         folds_to_run: List of fold indices (0-based) to execute. If None, runs all folds.
+        save_every: Save losses and BLEU to files every N epochs (default: 25)
     """
     func_dir = os.path.join(base_output_dir, periodic_func)
     os.makedirs(func_dir, exist_ok=True)
@@ -411,7 +415,7 @@ def run_cross_validation(periodic_func, loader, folds, base_output_dir, total_ep
         fold_info = f'Fold {fold_idx + 1}/{len(folds)}'
         train_losses, test_losses, bleus = run_training(
             model, train_iter, val_iter, loader, val_data, fold_dir, total_epochs, device, 
-            periodic_func=periodic_func, fold_info=fold_info, bleu_every=bleu_every
+            periodic_func=periodic_func, fold_info=fold_info, bleu_every=bleu_every, save_every=save_every
         )
         
         # Save fold statistics
@@ -481,6 +485,8 @@ def main():
                        help='Device to use (e.g., cuda:0, cuda:1). Overrides conf.py')
     parser.add_argument('--bleu-every', type=int, default=25,
                        help='Calculate BLEU every N epochs (default: 25). Set to 1 for every epoch.')
+    parser.add_argument('--save-every', type=int, default=25,
+                       help='Save losses and BLEU to files every N epochs (default: 25). Values are retained in memory.')
     args = parser.parse_args()
     
     # Configuration
@@ -616,14 +622,14 @@ def main():
             print(f"{'='*80}\n")
             
             results = run_cross_validation(
-                periodic_func, loader, folds, base_dir, epochs_per_fold, folds_to_run=folds_to_run, bleu_every=args.bleu_every
+                periodic_func, loader, folds, base_dir, epochs_per_fold, folds_to_run=folds_to_run, bleu_every=args.bleu_every, save_every=args.save_every
             )
             all_function_results[periodic_func] = results
     else:
         # New training, process all functions from the beginning
         for periodic_func in periodic_functions:
             results = run_cross_validation(
-                periodic_func, loader, folds, base_dir, epochs_per_fold, folds_to_run=None, bleu_every=args.bleu_every
+                periodic_func, loader, folds, base_dir, epochs_per_fold, folds_to_run=None, bleu_every=args.bleu_every, save_every=args.save_every
             )
             all_function_results[periodic_func] = results
     
