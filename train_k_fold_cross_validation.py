@@ -44,7 +44,7 @@ from util.bleu import evaluate_bleu
 from util.epoch_timer import epoch_time
 
 
-def get_most_recent_results_dir(base_path='/home/ubuntu/Desktop/GitHub/transformer-translation/results'):
+def get_most_recent_results_dir(base_path='/mnt/home/users/tic_163_uma/macorisd/GitHub/alt-positional-encoding-transformer/results'):
     """Find the most recent results_[timestamp] directory"""
     if not os.path.exists(base_path):
         return None
@@ -514,7 +514,7 @@ def main():
         if base_dir is None:
             print("No previous results directory found. Starting new training.")
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            base_dir = f'/home/ubuntu/Desktop/GitHub/transformer-translation/results/results_{timestamp}'
+            base_dir = f'/mnt/home/users/tic_163_uma/macorisd/GitHub/alt-positional-encoding-transformer/results/results_{timestamp}'
             os.makedirs(base_dir, exist_ok=True)
         else:
             print(f"Found previous results: {base_dir}")
@@ -549,7 +549,7 @@ def main():
     else:
         # Create new base directory with timestamp
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        base_dir = f'/home/ubuntu/Desktop/GitHub/transformer-translation/results/results_{timestamp}'
+        base_dir = f'/mnt/home/users/tic_163_uma/macorisd/GitHub/alt-positional-encoding-transformer/results/results_{timestamp}'
         os.makedirs(base_dir, exist_ok=True)
     
     print(f"\n{'#'*80}")
