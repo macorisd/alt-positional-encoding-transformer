@@ -19,6 +19,7 @@ Usage:
 Arguments:
     --resume            Resume from most recent results directory
     --functions STR     Comma-separated periodic functions (default: sinusoid,triangular,square,sawtooth)
+    --folds STR         Comma-separated fold numbers to train (1-based, e.g., 1,2,3,4,5). Default: all folds
     --device STR        Device override (e.g., cuda:0, cuda:1). Overrides conf.py
     --bleu-every INT    Calculate BLEU every N epochs (default: 25). Set to 1 for every epoch.
     --save-every INT    Save losses and BLEU to files every N epochs (default: 25). Values are retained in memory.
@@ -83,6 +84,44 @@ def find_resume_point(results_dir, periodic_functions, k_folds=10):
     
     # All complete
     return None, None
+
+
+def filter_folds_to_run(results_dir, periodic_func, k_folds=10, user_specified_folds=None):
+    """
+    Get list of folds that need to be executed for a specific periodic function.
+    Cleans up incomplete fold directories (those without model_best.pt).
+    
+    Args:
+        results_dir: Base results directory
+        periodic_func: Name of the periodic function
+        k_folds: Total number of folds
+        user_specified_folds: List of fold indices (0-based) that user wants to run, or None for all
+    
+    Returns: list of fold indices (0-based) that need to be executed, or None if all complete/skipped
+    """
+    func_dir = os.path.join(results_dir, periodic_func)
+    
+    # Determine which folds to check based on user specification
+    folds_to_check = user_specified_folds if user_specified_folds is not None else list(range(k_folds))
+    
+    if not os.path.exists(func_dir):
+        # This function hasn't been started yet - need to run specified folds
+        return folds_to_check
+    
+    incomplete_folds = []
+    for fold_idx in folds_to_check:
+        fold_dir = os.path.join(func_dir, f'{periodic_func}_{fold_idx + 1}')
+        model_path = os.path.join(fold_dir, 'model_best.pt')
+        
+        if not os.path.exists(model_path):
+            # This fold is incomplete
+            if os.path.exists(fold_dir):
+                print(f"Removing incomplete fold: {fold_dir}")
+                shutil.rmtree(fold_dir)
+            incomplete_folds.append(fold_idx)
+    
+    # Return None if all complete, otherwise return list of incomplete folds
+    return None if len(incomplete_folds) == 0 else incomplete_folds
 
 
 def get_incomplete_folds(results_dir, periodic_func, k_folds=10):
@@ -481,6 +520,8 @@ def main():
                        help='Resume from most recent results directory')
     parser.add_argument('--functions', type=str, default=None,
                        help='Comma-separated list of periodic functions (default: all available or detect from existing)')
+    parser.add_argument('--folds', type=str, default=None,
+                       help='Comma-separated fold numbers to train (1-based, e.g., 1,2,3,4,5). Default: all folds')
     parser.add_argument('--device', type=str, default=None,
                        help='Device to use (e.g., cuda:0, cuda:1). Overrides conf.py')
     parser.add_argument('--bleu-every', type=int, default=25,
@@ -499,6 +540,21 @@ def main():
     else:
         # Default list of functions
         periodic_functions = ['sinusoid', 'triangular', 'square', 'sawtooth']
+    
+    # Parse user-specified folds (convert from 1-based to 0-based)
+    user_specified_folds = None
+    if args.folds:
+        try:
+            # Convert from 1-based (user input) to 0-based (internal representation)
+            user_specified_folds = [int(f.strip()) - 1 for f in args.folds.split(',')]
+            # Validate fold numbers
+            if any(f < 0 or f >= k_folds for f in user_specified_folds):
+                print(f"Error: Fold numbers must be between 1 and {k_folds}")
+                return
+            print(f"User specified folds: {[f+1 for f in user_specified_folds]}")
+        except ValueError:
+            print("Error: --folds must be comma-separated integers (e.g., 1,2,3,4,5)")
+            return
     
     # Set device (CLI argument overrides conf.py)
     global device
@@ -533,16 +589,19 @@ def main():
                 else:
                     print(f"No existing functions found, will start with default: {', '.join(periodic_functions)}")
             
-            # Check if all training already completed
+            # Check if all training already completed (considering user-specified folds)
             all_complete = True
             for periodic_func in periodic_functions:
-                incomplete_folds = get_incomplete_folds(base_dir, periodic_func, k_folds)
+                incomplete_folds = filter_folds_to_run(base_dir, periodic_func, k_folds, user_specified_folds)
                 if incomplete_folds is not None:
                     all_complete = False
                     break
             
             if all_complete:
-                print("All training already completed!")
+                if user_specified_folds:
+                    print(f"All specified folds {[f+1 for f in user_specified_folds]} already completed!")
+                else:
+                    print("All training already completed!")
                 return
             
             print(f"Will check resume point for each function individually...")
@@ -559,6 +618,8 @@ def main():
     print(f"# K-folds: {k_folds}")
     print(f"# Epochs per fold: {epochs_per_fold}")
     print(f"# Periodic functions: {', '.join(periodic_functions)}")
+    if user_specified_folds:
+        print(f"# Specified folds: {[f+1 for f in user_specified_folds]}")
     if args.resume:
         print(f"# RESUME MODE: Will check each function individually")
     print(f"{'#'*80}\n")
@@ -581,7 +642,7 @@ def main():
     if args.resume:
         for periodic_func in periodic_functions:
             # Check which folds need to be executed for this function
-            folds_to_run = get_incomplete_folds(base_dir, periodic_func, k_folds)
+            folds_to_run = filter_folds_to_run(base_dir, periodic_func, k_folds, user_specified_folds)
             
             if folds_to_run is None:
                 print(f"\n{'='*80}")
@@ -629,7 +690,7 @@ def main():
         # New training, process all functions from the beginning
         for periodic_func in periodic_functions:
             results = run_cross_validation(
-                periodic_func, loader, folds, base_dir, epochs_per_fold, folds_to_run=None, bleu_every=args.bleu_every, save_every=args.save_every
+                periodic_func, loader, folds, base_dir, epochs_per_fold, folds_to_run=user_specified_folds, bleu_every=args.bleu_every, save_every=args.save_every
             )
             all_function_results[periodic_func] = results
     
