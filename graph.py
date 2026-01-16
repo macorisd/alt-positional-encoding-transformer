@@ -239,8 +239,8 @@ def process_results_folder(results_base_path):
 def create_consolidated_graphs(results_base_path):
     """
     Creates two separate PDFs:
-    - bleu_graph.pdf: BLEU scores for all 4 waves in different colors
-    - loss_graph.pdf: Train (solid) and validation (dashed) losses for all 4 waves
+    - bleu_global_graph.pdf: BLEU scores for all 4 waves in different colors
+    - loss_global_graph.pdf: Train (solid) and validation (dashed) losses for all 4 waves
     """
     base_path = Path(results_base_path)
     
@@ -274,7 +274,8 @@ def create_consolidated_graphs(results_base_path):
         waves_data[wave_name] = {
             'train_losses': [],
             'test_losses': [],
-            'bleu_scores': []
+            'bleu_scores': [],
+            'bleu_interval': None  # Store the BLEU calculation interval
         }
         
         if not wave_dir.exists():
@@ -330,19 +331,36 @@ def create_consolidated_graphs(results_base_path):
                 else:
                     bleu_avg.append(None)
             waves_data[wave_name]['bleu_scores'] = bleu_avg
+            
+            # Calculate BLEU interval (every how many epochs BLEU is calculated)
+            # Find the first non-None and then the next non-None to determine interval
+            non_none_indices = [i for i, val in enumerate(bleu_avg) if val is not None]
+            if len(non_none_indices) >= 2:
+                waves_data[wave_name]['bleu_interval'] = non_none_indices[1] - non_none_indices[0]
+            elif len(non_none_indices) == 1:
+                waves_data[wave_name]['bleu_interval'] = 1
     
     # Generate BLEU graph
     plt.figure(figsize=(10, 6))
     
     for wave_name, color in zip(wave_names, colors):
         bleu_data = waves_data[wave_name]['bleu_scores']
+        bleu_interval = waves_data[wave_name]['bleu_interval']
+        
         if len(bleu_data) > 0:
             # Filter out None values and keep track of corresponding epochs
             epochs_with_bleu = [i + 1 for i, b in enumerate(bleu_data) if b is not None]
             bleu_values = [b for b in bleu_data if b is not None]
             
             if bleu_values:  # Only plot if there are valid values
+                # Determine marker size based on BLEU interval
+                if bleu_interval and bleu_interval > 1:
+                    marker_size = 8  # Larger marker for sparse data
+                else:
+                    marker_size = 4  # Smaller marker for dense data
+                
                 plt.plot(epochs_with_bleu, bleu_values, color=color, linestyle='-', 
+                        marker='o', markersize=marker_size, 
                         label=wave_name.capitalize(), linewidth=2)
     
     plt.xlabel('Epoch', fontsize=12)
@@ -352,7 +370,7 @@ def create_consolidated_graphs(results_base_path):
     plt.grid(True, which='both', axis='both', alpha=0.3)
     plt.tight_layout()
     
-    bleu_output_path = results_dir / 'bleu_graph.pdf'
+    bleu_output_path = results_dir / 'bleu_global_graph.pdf'
     plt.savefig(bleu_output_path, dpi=300, bbox_inches='tight')
     plt.close()
     print(f"  BLEU graph saved: {bleu_output_path}")
@@ -381,7 +399,7 @@ def create_consolidated_graphs(results_base_path):
     plt.grid(True, which='both', axis='both', alpha=0.3)
     plt.tight_layout()
     
-    loss_output_path = results_dir / 'loss_graph.pdf'
+    loss_output_path = results_dir / 'loss_global_graph.pdf'
     plt.savefig(loss_output_path, dpi=300, bbox_inches='tight')
     plt.close()
     print(f"  Loss graph saved: {loss_output_path}")
