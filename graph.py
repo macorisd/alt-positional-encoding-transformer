@@ -75,6 +75,10 @@ def draw_bleu(bleu_data, save_path, title='BLEU Score'):
         plt.close()
         return
     
+    # Add initial point (0, 0)
+    epochs_with_bleu = [0] + epochs_with_bleu
+    bleu_values = [0] + bleu_values
+    
     plt.plot(epochs_with_bleu, bleu_values, 'go-', label='BLEU Score', linewidth=2, markersize=4)
     plt.xlabel('Epoch', fontsize=12)
     plt.ylabel('BLEU Score', fontsize=12)
@@ -353,14 +357,12 @@ def create_consolidated_graphs(results_base_path):
             bleu_values = [b for b in bleu_data if b is not None]
             
             if bleu_values:  # Only plot if there are valid values
-                # Determine marker size based on BLEU interval
-                if bleu_interval and bleu_interval > 1:
-                    marker_size = 8  # Larger marker for sparse data
-                else:
-                    marker_size = 4  # Smaller marker for dense data
+                # Add initial point (0, 0)
+                epochs_with_bleu = [0] + epochs_with_bleu
+                bleu_values = [0] + bleu_values
                 
                 plt.plot(epochs_with_bleu, bleu_values, color=color, linestyle='-', 
-                        marker='o', markersize=marker_size, 
+                        marker='o', markersize=4, 
                         label=wave_name.capitalize(), linewidth=2)
     
     plt.xlabel('Epoch', fontsize=12)
