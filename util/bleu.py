@@ -1,68 +1,105 @@
 """
-@author : Hyunwoong
-@when : 2019-12-22
-@homepage : https://github.com/gusdnd852
+BLEU score calculation using sacreBLEU.
+Provides standardized, reproducible BLEU scores compatible with academic benchmarks.
 """
-import math
-from collections import Counter
+from sacrebleu import corpus_bleu, BLEU
 
-import numpy as np
+from util.decoding import idx_to_text, batch_greedy_decode
 
 
-def bleu_stats(hypothesis, reference):
-    """Compute statistics for BLEU."""
-    stats = []
-    stats.append(len(hypothesis))
-    stats.append(len(reference))
-    for n in range(1, 5):
-        s_ngrams = Counter(
-            [tuple(hypothesis[i:i + n]) for i in range(len(hypothesis) + 1 - n)]
+def compute_bleu(hypotheses, references, lowercase=False):
+    """
+    Compute corpus-level BLEU score using sacreBLEU.
+    
+    Args:
+        hypotheses: List of hypothesis strings (generated translations)
+        references: List of reference strings (ground truth translations)
+        lowercase: If True, compute case-insensitive BLEU
+        
+    Returns:
+        BLEU score (0-100 scale)
+    """
+    # sacreBLEU expects references as list of lists (supports multiple references per hypothesis)
+    refs_wrapped = [[ref] for ref in references]
+    
+    # Transpose for sacreBLEU format: list of reference lists, one per reference set
+    refs_transposed = list(zip(*refs_wrapped))
+    refs_transposed = [list(r) for r in refs_transposed]
+    
+    bleu = corpus_bleu(hypotheses, refs_transposed, lowercase=lowercase)
+    return bleu.score
+
+
+def compute_bleu_detailed(hypotheses, references, lowercase=False):
+    """
+    Compute BLEU score with detailed breakdown.
+    
+    Args:
+        hypotheses: List of hypothesis strings
+        references: List of reference strings
+        lowercase: If True, compute case-insensitive BLEU
+        
+    Returns:
+        dict with 'score', 'signature', 'precisions', 'bp' (brevity penalty)
+    """
+    refs_wrapped = [[ref] for ref in references]
+    refs_transposed = list(zip(*refs_wrapped))
+    refs_transposed = [list(r) for r in refs_transposed]
+    
+    bleu = corpus_bleu(hypotheses, refs_transposed, lowercase=lowercase)
+    
+    return {
+        'score': bleu.score,
+        'signature': bleu.format(),
+        'precisions': bleu.precisions,
+        'bp': bleu.bp
+    }
+
+
+def evaluate_bleu(model, iterator, vocab_target, max_len, sos_idx, eos_idx, pad_idx, device):
+    """
+    Evaluate model using autoregressive generation and sacreBLEU.
+    
+    Args:
+        model: Transformer model
+        iterator: Data iterator yielding (src, trg) batches
+        vocab_target: Target vocabulary with itos mapping
+        max_len: Maximum generation length
+        sos_idx: Start-of-sequence token index
+        eos_idx: End-of-sequence token index
+        pad_idx: Padding token index
+        device: Device to run on
+        
+    Returns:
+        BLEU score (0-100 scale)
+    """
+    model.eval()
+    
+    all_hypotheses = []
+    all_references = []
+    
+    for batch_idx, batch in enumerate(iterator):
+        print(f'    Processing batch {batch_idx + 1} for BLEU calculation...')
+        
+        src, trg = batch
+        
+        # Generate translations autoregressively
+        generated = batch_greedy_decode(
+            model, src, max_len, sos_idx, eos_idx, pad_idx, device, verbose=True
         )
-        r_ngrams = Counter(
-            [tuple(reference[i:i + n]) for i in range(len(reference) + 1 - n)]
-        )
-
-        stats.append(max([sum((s_ngrams & r_ngrams).values()), 0]))
-        stats.append(max([len(hypothesis) + 1 - n, 0]))
-    return stats
-
-
-def bleu(stats):
-    """Compute BLEU given n-gram statistics."""
-    if len(list(filter(lambda x: x == 0, stats))) > 0:
-        return 0
-    (c, r) = stats[:2]
-    log_bleu_prec = sum(
-        [math.log(float(x) / y) for x, y in zip(stats[2::2], stats[3::2])]
-    ) / 4.
-    return math.exp(min([0, 1 - float(r) / c]) + log_bleu_prec)
+        
+        # Convert to text
+        for i, gen in enumerate(generated):
+            hyp = idx_to_text(gen, vocab_target)
+            ref = idx_to_text(trg[i], vocab_target)
+            
+            all_hypotheses.append(hyp)
+            all_references.append(ref)
+    
+    return compute_bleu(all_hypotheses, all_references)
 
 
-def get_bleu(hypotheses, reference):
-    """Get validation BLEU score for dev set."""
-    stats = np.array([0., 0., 0., 0., 0., 0., 0., 0., 0., 0.])
-    for hyp, ref in zip(hypotheses, reference):
-        stats += np.array(bleu_stats(hyp, ref))
-    return 100 * bleu(stats)
-
-
+# Backward compatibility alias
 def idx_to_word(x, vocab_transform):
-    words = []
-
-    if not hasattr(vocab_transform, 'itos') or vocab_transform.itos is None:
-        raise AttributeError("VocabTransform does not have 'itos' (index-to-token mapping) built. "
-                             "Did you forget to call build_vocab()?")
-
-    for i in x:
-        idx = int(i)
-        try:
-            if 0 <= idx < len(vocab_transform.itos):
-                word = vocab_transform.itos[idx]
-            else:
-                word = '<unk>'
-            if '<' not in word:
-                words.append(word)
-        except Exception as e:
-            print(f"[idx_to_word error] index: {idx}, error: {e}")
-            words.append('<unk>')
-    return " ".join(words)
+    """Alias for idx_to_text for backward compatibility."""
+    return idx_to_text(x, vocab_transform)

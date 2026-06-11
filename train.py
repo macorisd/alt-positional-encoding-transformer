@@ -11,7 +11,7 @@ from torch.optim import Adam
 
 from data import *
 from models.model.transformer import Transformer
-from util.bleu import idx_to_word, get_bleu
+from util.bleu import evaluate_bleu
 from util.epoch_timer import epoch_time
 
 
@@ -75,9 +75,14 @@ def train(model, iterator, optimizer, criterion, clip):
 
 
 def evaluate(model, iterator, criterion):
+    """
+    Evaluate model computing loss and BLEU score.
+    Uses autoregressive generation for BLEU calculation.
+    """
     model.eval()
     epoch_loss = 0
-    batch_bleu = []
+    
+    # Calculate loss with teacher forcing (standard for loss computation)
     with torch.no_grad():
         for i, batch in enumerate(iterator):
             src, trg = batch
@@ -88,25 +93,21 @@ def evaluate(model, iterator, criterion):
 
             loss = criterion(output_reshape, trg_flat)
             epoch_loss += loss.item()
-
-            total_bleu = []
-            for j in range(trg.shape[0]):
-                try:
-                    trg_words = idx_to_word(trg[j], loader.target)     
-                    output_words = output[j].max(dim=1)[1]              
-                    output_words = idx_to_word(output_words, loader.target)
-                    # output_words = idx_to_word(output_words, loader.target.vocab)
-                    bleu = get_bleu(hypotheses=output_words.split(), reference=trg_words.split())
-                    total_bleu.append(bleu)
-                except Exception as e:
-                    print(f"BLEU failure on sample No.{j} : {e}")
-
-            if total_bleu:
-                avg_bleu = sum(total_bleu) / len(total_bleu)
-                batch_bleu.append(avg_bleu)
-
-    batch_bleu_score = sum(batch_bleu) / len(batch_bleu) if batch_bleu else 0
-    return epoch_loss / len(iterator), batch_bleu_score
+    
+    # Calculate BLEU with autoregressive generation
+    trg_eos_idx = loader.target.vocab['<eos>']
+    bleu_score = evaluate_bleu(
+        model=model,
+        iterator=iterator,
+        vocab_target=loader.target,
+        max_len=max_len,
+        sos_idx=trg_sos_idx,
+        eos_idx=trg_eos_idx,
+        pad_idx=trg_pad_idx,
+        device=device
+    )
+    
+    return epoch_loss / len(iterator), bleu_score
 
 
 def run(total_epoch, best_loss):

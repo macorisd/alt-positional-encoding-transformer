@@ -1,6 +1,14 @@
 .ipynb_checkpoints/
 venv/
+.venv/
 *.pt
+*.pth
+*.out
+*.err
 __pycache__/
 
-result*/
+results/
+saved/
+outputs/
+graphs/
+graphs_k_fold/
