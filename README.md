@@ -1,3 +1,11 @@
+# Basic Transformer architecture - Master's Thesis by Macorís Decena Giménez
+
+This fork was developed as part of my Master's Thesis, which studies the replacement of the original sinusoidal positional encoding used in Transformer-based architectures with alternative periodic functions. In this repository, the original machine translation Transformer implementation has been adapted to support different positional encoding waveforms and to run the experimental validation workflow used in the thesis.
+
+The trained model weights are available in Google Drive: [https://drive.google.com/drive/folders/1IxeLRsapGrlCpydSH6j553VWeqcCe1LQ?usp=sharing](https://drive.google.com/drive/folders/1IxeLRsapGrlCpydSH6j553VWeqcCe1LQ?usp=sharing)
+
+---
+
 ### 项目简介
 
 这是原仓库https://github.com/hyunwoongko/transformer 的fork, 原仓库实现了一个pytorch-scratch的transformer机器翻译任务(vs multi30k数据集)
