@@ -21,8 +21,11 @@ Arguments:
     --functions STR     Comma-separated periodic functions (default: sinusoid,triangular,square,sawtooth)
     --folds STR         Comma-separated fold numbers to train (1-based, e.g., 1,2,3,4,5). Default: all folds
     --device STR        Device override (e.g., cuda:0, cuda:1). Overrides conf.py
-    --bleu-every INT    Calculate BLEU every N epochs (default: 25). Set to 1 for every epoch.
-    --save-every INT    Save losses and BLEU to files every N epochs (default: 25). Values are retained in memory.
+    --bleu-every INT    Calculate BLEU every N epochs for Multi30K only (default: 25).
+    --save-every INT    Save losses to files every N epochs (default: 25). Values are retained in memory.
+    --batch-size INT    Override training batch size from conf.py
+    --epochs-per-fold INT
+                       Number of epochs per fold (default: 1000)
 """
 
 import os
@@ -41,7 +44,6 @@ from conf import *
 from util.data_loader import DataLoader
 from util.tokenizer import Tokenizer
 from models.model.transformer import Transformer
-from util.bleu import evaluate_bleu
 from util.epoch_timer import epoch_time
 
 
@@ -161,14 +163,65 @@ def initialize_weights(m):
         nn.init.kaiming_uniform_(m.weight.data)
 
 
-def prepare_data_loaders():
+def should_compute_bleu(dataset_name):
+    return dataset_name == "multi30k"
+
+
+def build_fold_stats(fold_idx, train_losses, test_losses, bleus=None):
+    fold_stats = {
+        'fold': fold_idx + 1,
+        'final_train_loss': train_losses[-1],
+        'final_val_loss': test_losses[-1],
+        'best_val_loss': min(test_losses),
+    }
+    if bleus is not None:
+        valid_bleus = [b for b in bleus if b is not None]
+        fold_stats['final_bleu'] = bleus[-1]
+        fold_stats['best_bleu'] = max(valid_bleus) if valid_bleus else 0.0
+    return fold_stats
+
+
+def load_fold_stats(fold_dir, fold_idx, enable_bleu):
+    with open(os.path.join(fold_dir, 'train_loss.txt'), 'r') as f:
+        train_losses = eval(f.read())
+    with open(os.path.join(fold_dir, 'test_loss.txt'), 'r') as f:
+        test_losses = eval(f.read())
+
+    bleus = None
+    if enable_bleu:
+        with open(os.path.join(fold_dir, 'bleu.txt'), 'r') as f:
+            bleus = eval(f.read())
+
+    return build_fold_stats(fold_idx, train_losses, test_losses, bleus)
+
+
+def dataset_tokenizers(dataset_name, tokenizer):
+    if dataset_name == "multi30k":
+        return None, None
+    if dataset_name in {"chembl_smiles_inchi", "ensembl_cds_protein"}:
+        return tokenizer.tokenize_char, tokenizer.tokenize_char
+    if dataset_name == "codesearchnet_python":
+        return tokenizer.tokenize_code, tokenizer.tokenize_code
+    raise ValueError(
+        f"Unsupported dataset: {dataset_name}. "
+        "Use multi30k, chembl_smiles_inchi, ensembl_cds_protein, or codesearchnet_python."
+    )
+
+
+def prepare_data_loaders(dataset_name="multi30k", dataset_root=None):
     """Prepare data loaders for cross validation"""
     tokenizer = Tokenizer()
+    tokenize_src, tokenize_tgt = dataset_tokenizers(dataset_name, tokenizer)
     loader = DataLoader(ext=('en', 'de'),
                        tokenize_en=tokenizer.tokenize_en,
                        tokenize_de=tokenizer.tokenize_de,
                        init_token='<sos>',
-                       eos_token='<eos>')
+                       eos_token='<eos>',
+                       dataset_name=dataset_name,
+                       dataset_root=dataset_root,
+                       tokenize_src=tokenize_src,
+                       tokenize_tgt=tokenize_tgt,
+                       max_tokens=max_len)
     
     train_data, valid_data, test_data = loader.make_dataset()
     loader.build_vocab(train_data=train_data, min_freq=2)
@@ -257,6 +310,8 @@ def evaluate(model, iterator, criterion, loader, device, val_data, compute_bleu=
     # Calculate BLEU with autoregressive generation (uses smaller batch_size)
     bleu_score = None
     if compute_bleu:
+        from util.bleu import evaluate_bleu
+
         print(f'  Computing BLEU with autoregressive generation (batch_size={batch_size})...')
         
         # Create new iterator with batch size for BLEU
@@ -282,14 +337,15 @@ def evaluate(model, iterator, criterion, loader, device, val_data, compute_bleu=
     return epoch_loss / len(iterator), bleu_score
 
 
-def run_training(model, train_iter, valid_iter, loader, val_data, output_dir, total_epochs, device, periodic_func, fold_info, bleu_every=25, save_every=25):
+def run_training(model, train_iter, valid_iter, loader, val_data, output_dir, total_epochs, device, periodic_func, fold_info, bleu_every=25, save_every=25, enable_bleu=True):
     """
     Run complete training.
     
     Args:
         periodic_func: Name of periodic function (e.g., 'sinusoid')
         fold_info: String like 'Fold 1/10'
-        save_every: Save losses and BLEU to files every N epochs (default: 25)
+        save_every: Save losses to files every N epochs (default: 25)
+        enable_bleu: Calculate BLEU. This should only be True for translation datasets.
     """
     optimizer = Adam(params=model.parameters(),
                     lr=init_lr,
@@ -302,7 +358,8 @@ def run_training(model, train_iter, valid_iter, loader, val_data, output_dir, to
     
     criterion = nn.CrossEntropyLoss(ignore_index=loader.source.vocab['<pad>'])
     
-    train_losses, test_losses, bleus = [], [], []
+    train_losses, test_losses = [], []
+    bleus = [] if enable_bleu else None
     best_loss = float('inf')
     best_model_state = None
     
@@ -311,8 +368,8 @@ def run_training(model, train_iter, valid_iter, loader, val_data, output_dir, to
         
         train_loss = train_epoch(model, train_iter, optimizer, criterion, clip)
         
-        # Calculate BLEU only every N epochs or on last epoch
-        compute_bleu = (epoch + 1) % bleu_every == 0 or epoch == total_epochs - 1
+        # Calculate BLEU only for translation datasets, every N epochs or on the last epoch.
+        compute_bleu = enable_bleu and ((epoch + 1) % bleu_every == 0 or epoch == total_epochs - 1)
         valid_loss, bleu = evaluate(model, valid_iter, criterion, loader, device, val_data, compute_bleu=compute_bleu)
         
         end_time = time.time()
@@ -322,7 +379,8 @@ def run_training(model, train_iter, valid_iter, loader, val_data, output_dir, to
         
         train_losses.append(train_loss)
         test_losses.append(valid_loss)
-        bleus.append(bleu)  # Append None if not calculated, or the actual value
+        if enable_bleu:
+            bleus.append(bleu)  # Append None if not calculated, or the actual value
         
         epoch_mins, epoch_secs = epoch_time(start_time, end_time)
         
@@ -339,16 +397,18 @@ def run_training(model, train_iter, valid_iter, loader, val_data, output_dir, to
             with open(os.path.join(output_dir, 'test_loss.txt'), 'w') as f:
                 f.write(str(test_losses))
             
-            with open(os.path.join(output_dir, 'bleu.txt'), 'w') as f:
-                f.write(str(bleus))
+            if enable_bleu:
+                with open(os.path.join(output_dir, 'bleu.txt'), 'w') as f:
+                    f.write(str(bleus))
         
         print(f'[{periodic_func} | {fold_info}] Epoch {epoch+1}/{total_epochs} | Time: {epoch_mins}m {epoch_secs}s')
         print(f'  Train Loss: {train_loss:.3f} | Train PPL: {math.exp(train_loss):7.3f}')
         print(f'  Val Loss: {valid_loss:.3f} | Val PPL: {math.exp(valid_loss):7.3f}')
-        if bleu is not None:
-            print(f'  BLEU Score: {bleu:.3f}')
-        else:
-            print(f'  BLEU Score: (skipped, calculated every {bleu_every} epochs)')
+        if enable_bleu:
+            if bleu is not None:
+                print(f'  BLEU Score: {bleu:.3f}')
+            else:
+                print(f'  BLEU Score: (skipped, calculated every {bleu_every} epochs)')
     
     # Save best model at the end of training
     if best_model_state is not None:
@@ -359,13 +419,14 @@ def run_training(model, train_iter, valid_iter, loader, val_data, output_dir, to
     return train_losses, test_losses, bleus
 
 
-def run_cross_validation(periodic_func, loader, folds, base_output_dir, total_epochs=1000, folds_to_run=None, bleu_every=25, save_every=25):
+def run_cross_validation(periodic_func, loader, folds, base_output_dir, total_epochs=1000, folds_to_run=None, bleu_every=25, save_every=25, enable_bleu=True):
     """
     Run cross validation for a specific periodic function
     
     Args:
         folds_to_run: List of fold indices (0-based) to execute. If None, runs all folds.
-        save_every: Save losses and BLEU to files every N epochs (default: 25)
+        save_every: Save losses to files every N epochs (default: 25)
+        enable_bleu: Calculate BLEU. This should only be True for translation datasets.
     """
     func_dir = os.path.join(base_output_dir, periodic_func)
     os.makedirs(func_dir, exist_ok=True)
@@ -388,23 +449,7 @@ def run_cross_validation(periodic_func, loader, folds, base_output_dir, total_ep
             fold_dir = os.path.join(func_dir, f'{periodic_func}_{fold_idx + 1}')
             if os.path.exists(fold_dir):
                 try:
-                    with open(os.path.join(fold_dir, 'train_loss.txt'), 'r') as f:
-                        train_losses = eval(f.read())
-                    with open(os.path.join(fold_dir, 'test_loss.txt'), 'r') as f:
-                        test_losses = eval(f.read())
-                    with open(os.path.join(fold_dir, 'bleu.txt'), 'r') as f:
-                        bleus = eval(f.read())
-                    
-                    # Filter out None values from bleus before finding max
-                    valid_bleus = [b for b in bleus if b is not None]
-                    fold_stats = {
-                        'fold': fold_idx + 1,
-                        'final_train_loss': train_losses[-1],
-                        'final_val_loss': test_losses[-1],
-                        'final_bleu': bleus[-1],
-                        'best_val_loss': min(test_losses),
-                        'best_bleu': max(valid_bleus) if valid_bleus else 0.0
-                    }
+                    fold_stats = load_fold_stats(fold_dir, fold_idx, enable_bleu)
                     all_results.append(fold_stats)
                     print(f"Loaded existing results for Fold {fold_idx + 1}")
                 except:
@@ -454,28 +499,21 @@ def run_cross_validation(periodic_func, loader, folds, base_output_dir, total_ep
         fold_info = f'Fold {fold_idx + 1}/{len(folds)}'
         train_losses, test_losses, bleus = run_training(
             model, train_iter, val_iter, loader, val_data, fold_dir, total_epochs, device, 
-            periodic_func=periodic_func, fold_info=fold_info, bleu_every=bleu_every, save_every=save_every
+            periodic_func=periodic_func, fold_info=fold_info, bleu_every=bleu_every,
+            save_every=save_every, enable_bleu=enable_bleu
         )
         
         # Save fold statistics
-        # Filter out None values from bleus before finding max
-        valid_bleus = [b for b in bleus if b is not None]
-        fold_stats = {
-            'fold': fold_idx + 1,
-            'final_train_loss': train_losses[-1],
-            'final_val_loss': test_losses[-1],
-            'final_bleu': bleus[-1],
-            'best_val_loss': min(test_losses),
-            'best_bleu': max(valid_bleus) if valid_bleus else 0.0
-        }
+        fold_stats = build_fold_stats(fold_idx, train_losses, test_losses, bleus)
         all_results.append(fold_stats)
         
         print(f"\nFold {fold_idx + 1} completed:")
         print(f"  Final Train Loss: {fold_stats['final_train_loss']:.4f}")
         print(f"  Final Val Loss: {fold_stats['final_val_loss']:.4f}")
-        print(f"  Final BLEU: {fold_stats['final_bleu']:.4f}")
         print(f"  Best Val Loss: {fold_stats['best_val_loss']:.4f}")
-        print(f"  Best BLEU: {fold_stats['best_bleu']:.4f}")
+        if enable_bleu:
+            print(f"  Final BLEU: {fold_stats['final_bleu']:.4f}")
+            print(f"  Best BLEU: {fold_stats['best_bleu']:.4f}")
     
     # Save results summary
     summary_path = os.path.join(func_dir, 'summary.txt')
@@ -487,26 +525,32 @@ def run_cross_validation(periodic_func, loader, folds, base_output_dir, total_ep
             f.write(f"Fold {stats['fold']}:\n")
             f.write(f"  Final Train Loss: {stats['final_train_loss']:.4f}\n")
             f.write(f"  Final Val Loss: {stats['final_val_loss']:.4f}\n")
-            f.write(f"  Final BLEU: {stats['final_bleu']:.4f}\n")
             f.write(f"  Best Val Loss: {stats['best_val_loss']:.4f}\n")
-            f.write(f"  Best BLEU: {stats['best_bleu']:.4f}\n\n")
+            if enable_bleu:
+                f.write(f"  Final BLEU: {stats['final_bleu']:.4f}\n")
+                f.write(f"  Best BLEU: {stats['best_bleu']:.4f}\n")
+            f.write("\n")
         
         # Averages
         avg_train_loss = sum(s['final_train_loss'] for s in all_results) / len(all_results)
         avg_val_loss = sum(s['final_val_loss'] for s in all_results) / len(all_results)
-        avg_bleu = sum(s['final_bleu'] for s in all_results) / len(all_results)
-        avg_best_bleu = sum(s['best_bleu'] for s in all_results) / len(all_results)
         
         f.write(f"\nAVERAGE ACROSS ALL FOLDS:\n")
         f.write(f"  Avg Final Train Loss: {avg_train_loss:.4f}\n")
         f.write(f"  Avg Final Val Loss: {avg_val_loss:.4f}\n")
-        f.write(f"  Avg Final BLEU: {avg_bleu:.4f}\n")
-        f.write(f"  Avg Best BLEU: {avg_best_bleu:.4f}\n")
+        if enable_bleu:
+            avg_bleu = sum(s['final_bleu'] for s in all_results) / len(all_results)
+            avg_best_bleu = sum(s['best_bleu'] for s in all_results) / len(all_results)
+            f.write(f"  Avg Final BLEU: {avg_bleu:.4f}\n")
+            f.write(f"  Avg Best BLEU: {avg_best_bleu:.4f}\n")
     
     print(f"\n{'='*80}")
     print(f"COMPLETED: {periodic_func}")
-    print(f"Average Final BLEU: {avg_bleu:.4f}")
-    print(f"Average Best BLEU: {avg_best_bleu:.4f}")
+    print(f"Average Final Train Loss: {avg_train_loss:.4f}")
+    print(f"Average Final Val Loss: {avg_val_loss:.4f}")
+    if enable_bleu:
+        print(f"Average Final BLEU: {avg_bleu:.4f}")
+        print(f"Average Best BLEU: {avg_best_bleu:.4f}")
     print(f"{'='*80}\n")
     
     return all_results
@@ -527,12 +571,36 @@ def main():
     parser.add_argument('--bleu-every', type=int, default=25,
                        help='Calculate BLEU every N epochs (default: 25). Set to 1 for every epoch.')
     parser.add_argument('--save-every', type=int, default=25,
-                       help='Save losses and BLEU to files every N epochs (default: 25). Values are retained in memory.')
+                       help='Save losses to files every N epochs (default: 25). Values are retained in memory.')
+    parser.add_argument('--dataset', type=str, default='multi30k',
+                       help='Dataset to train on: multi30k, chembl_smiles_inchi, ensembl_cds_protein, codesearchnet_python.')
+    parser.add_argument('--dataset-root', type=str, default=None,
+                       help='Root containing prepared structured datasets. Defaults to $ALT_WAVES_DATA_ROOT or ~/fscratch/datasets/alt_waves.')
+    parser.add_argument('--run-id', type=str, default=None,
+                       help='Fixed run identifier used in results/<dataset>/results_<run-id>. Useful for parallel fold jobs.')
+    parser.add_argument('--batch-size', type=int, default=None,
+                       help='Override training/evaluation batch size from conf.py.')
+    parser.add_argument('--epochs-per-fold', type=int, default=1000,
+                       help='Number of epochs to train each fold (default: 1000).')
     args = parser.parse_args()
+    dataset_name = args.dataset.strip()
     
     # Configuration
     k_folds = 10
-    epochs_per_fold = 1000
+    if args.epochs_per_fold <= 0:
+        print("Error: --epochs-per-fold must be a positive integer")
+        return
+    epochs_per_fold = args.epochs_per_fold
+    enable_bleu = should_compute_bleu(dataset_name)
+    global device, batch_size
+    if args.batch_size is not None:
+        if args.batch_size <= 0:
+            print("Error: --batch-size must be a positive integer")
+            return
+        batch_size = args.batch_size
+        print(f"Using batch size from CLI: {batch_size}")
+    else:
+        print(f"Using batch size from conf.py: {batch_size}")
     
     # Determine periodic functions to use
     if args.functions:
@@ -557,7 +625,6 @@ def main():
             return
     
     # Set device (CLI argument overrides conf.py)
-    global device
     if args.device:
         device = torch.device(args.device)
         print(f"Using device from CLI: {device}")
@@ -565,12 +632,18 @@ def main():
         print(f"Using device from conf.py: {device}")
     
     # Determine base directory and resume point
-    if args.resume:
-        base_dir = get_most_recent_results_dir()
+    results_root = f'/mnt/home/users/tic_163_uma/macorisd/GitHub/alt-positional-encoding-transformer/results/{dataset_name}'
+    if args.run_id:
+        base_dir = f'{results_root}/results_{args.run_id}'
+        os.makedirs(base_dir, exist_ok=True)
+        if args.resume:
+            print(f"Using fixed run-id results directory: {base_dir}")
+    elif args.resume:
+        base_dir = get_most_recent_results_dir(results_root)
         if base_dir is None:
             print("No previous results directory found. Starting new training.")
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            base_dir = f'/mnt/home/users/tic_163_uma/macorisd/GitHub/alt-positional-encoding-transformer/results/results_{timestamp}'
+            base_dir = f'{results_root}/results_{timestamp}'
             os.makedirs(base_dir, exist_ok=True)
         else:
             print(f"Found previous results: {base_dir}")
@@ -608,15 +681,20 @@ def main():
     else:
         # Create new base directory with timestamp
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        base_dir = f'/mnt/home/users/tic_163_uma/macorisd/GitHub/alt-positional-encoding-transformer/results/results_{timestamp}'
+        base_dir = f'{results_root}/results_{timestamp}'
         os.makedirs(base_dir, exist_ok=True)
     
     print(f"\n{'#'*80}")
     print(f"# 10-FOLD CROSS VALIDATION - POSITIONAL ENCODING COMPARISON")
     print(f"# Timestamp: {os.path.basename(base_dir)}")
     print(f"# Output directory: {base_dir}")
+    print(f"# Dataset: {dataset_name}")
+    if args.run_id:
+        print(f"# Run id: {args.run_id}")
+    print(f"# Dataset root: {args.dataset_root or os.environ.get('ALT_WAVES_DATA_ROOT') or os.path.join(os.path.expanduser('~'), 'fscratch', 'datasets', 'alt_waves')}")
     print(f"# K-folds: {k_folds}")
     print(f"# Epochs per fold: {epochs_per_fold}")
+    print(f"# BLEU/SacreBLEU: {'enabled' if enable_bleu else 'disabled (train/eval loss only)'}")
     print(f"# Periodic functions: {', '.join(periodic_functions)}")
     if user_specified_folds:
         print(f"# Specified folds: {[f+1 for f in user_specified_folds]}")
@@ -626,7 +704,7 @@ def main():
     
     # Prepare data
     print("Loading and preparing data...")
-    loader, train_data, valid_data, test_data = prepare_data_loaders()
+    loader, train_data, valid_data, test_data = prepare_data_loaders(dataset_name=dataset_name, dataset_root=args.dataset_root)
     
     print(f"Total training samples: {len(train_data)}")
     print(f"Creating {k_folds} folds...")
@@ -656,22 +734,7 @@ def main():
                     fold_dir = os.path.join(func_dir, f'{periodic_func}_{fold_idx + 1}')
                     if os.path.exists(fold_dir):
                         try:
-                            with open(os.path.join(fold_dir, 'train_loss.txt'), 'r') as f:
-                                train_losses = eval(f.read())
-                            with open(os.path.join(fold_dir, 'test_loss.txt'), 'r') as f:
-                                test_losses = eval(f.read())
-                            with open(os.path.join(fold_dir, 'bleu.txt'), 'r') as f:
-                                bleus = eval(f.read())
-                            
-                            valid_bleus = [b for b in bleus if b is not None]
-                            fold_stats = {
-                                'fold': fold_idx + 1,
-                                'final_train_loss': train_losses[-1],
-                                'final_val_loss': test_losses[-1],
-                                'final_bleu': bleus[-1],
-                                'best_val_loss': min(test_losses),
-                                'best_bleu': max(valid_bleus) if valid_bleus else 0.0
-                            }
+                            fold_stats = load_fold_stats(fold_dir, fold_idx, enable_bleu)
                             all_results.append(fold_stats)
                         except:
                             pass
@@ -683,14 +746,16 @@ def main():
             print(f"{'='*80}\n")
             
             results = run_cross_validation(
-                periodic_func, loader, folds, base_dir, epochs_per_fold, folds_to_run=folds_to_run, bleu_every=args.bleu_every, save_every=args.save_every
+                periodic_func, loader, folds, base_dir, epochs_per_fold, folds_to_run=folds_to_run,
+                bleu_every=args.bleu_every, save_every=args.save_every, enable_bleu=enable_bleu
             )
             all_function_results[periodic_func] = results
     else:
         # New training, process all functions from the beginning
         for periodic_func in periodic_functions:
             results = run_cross_validation(
-                periodic_func, loader, folds, base_dir, epochs_per_fold, folds_to_run=user_specified_folds, bleu_every=args.bleu_every, save_every=args.save_every
+                periodic_func, loader, folds, base_dir, epochs_per_fold, folds_to_run=user_specified_folds,
+                bleu_every=args.bleu_every, save_every=args.save_every, enable_bleu=enable_bleu
             )
             all_function_results[periodic_func] = results
     
@@ -701,12 +766,20 @@ def main():
         f.write(f"{'='*80}\n\n")
         
         for func, results in all_function_results.items():
-            avg_bleu = sum(s['final_bleu'] for s in results) / len(results)
-            avg_best_bleu = sum(s['best_bleu'] for s in results) / len(results)
-            
             f.write(f"{func}:\n")
-            f.write(f"  Average Final BLEU: {avg_bleu:.4f}\n")
-            f.write(f"  Average Best BLEU: {avg_best_bleu:.4f}\n\n")
+            if not results:
+                f.write("  No completed folds found.\n\n")
+                continue
+            avg_train_loss = sum(s['final_train_loss'] for s in results) / len(results)
+            avg_val_loss = sum(s['final_val_loss'] for s in results) / len(results)
+            f.write(f"  Average Final Train Loss: {avg_train_loss:.4f}\n")
+            f.write(f"  Average Final Val Loss: {avg_val_loss:.4f}\n")
+            if enable_bleu:
+                avg_bleu = sum(s['final_bleu'] for s in results) / len(results)
+                avg_best_bleu = sum(s['best_bleu'] for s in results) / len(results)
+                f.write(f"  Average Final BLEU: {avg_bleu:.4f}\n")
+                f.write(f"  Average Best BLEU: {avg_best_bleu:.4f}\n")
+            f.write("\n")
     
     print(f"\n{'#'*80}")
     print(f"# ALL CROSS VALIDATIONS COMPLETED")
