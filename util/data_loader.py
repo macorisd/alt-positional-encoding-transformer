@@ -13,11 +13,19 @@ from typing import Callable, Iterator
 
 
 class VocabTransform:
-    def __init__(self, tokenize: Callable[[str], list[str]], init_token: str, eos_token: str, lower: bool = True):
+    def __init__(
+        self,
+        tokenize: Callable[[str], list[str]],
+        init_token: str,
+        eos_token: str,
+        lower: bool = True,
+        max_tokens: int | None = None,
+    ):
         self.tokenize = tokenize
         self.init_token = init_token
         self.eos_token = eos_token
         self.lower = lower
+        self.max_tokens = max_tokens
         self.vocab: dict[str, int] | None = None
         self.itos: list[str] | None = None
         self.unk_token = "<unk>"
@@ -48,6 +56,8 @@ class VocabTransform:
         if self.lower:
             text = text.lower()
         tokens = self.tokenize(text)
+        if self.max_tokens is not None:
+            tokens = tokens[: max(0, self.max_tokens - 2)]
         return [self.init_token] + tokens + [self.eos_token]
 
     def numericalize(self, tokens: list[str]) -> torch.Tensor:
@@ -71,25 +81,61 @@ class DataLoader:
     source: VocabTransform | None = None
     target: VocabTransform | None = None
 
-    def __init__(self, ext: tuple[str, str], tokenize_en: Callable, tokenize_de: Callable, 
-                 init_token: str, eos_token: str):
+    def __init__(
+        self,
+        ext: tuple[str, str],
+        tokenize_en: Callable,
+        tokenize_de: Callable,
+        init_token: str,
+        eos_token: str,
+        dataset_name: str = "multi30k",
+        dataset_root: str | None = None,
+        tokenize_src: Callable | None = None,
+        tokenize_tgt: Callable | None = None,
+        lower: bool | None = None,
+        max_tokens: int | None = None,
+    ):
         self.ext = ext
         self.tokenize_en = tokenize_en
         self.tokenize_de = tokenize_de
+        self.tokenize_src = tokenize_src
+        self.tokenize_tgt = tokenize_tgt
         self.init_token = init_token
         self.eos_token = eos_token
-        print('Dataset initialization started.')
+        self.dataset_name = dataset_name
+        self.dataset_root = dataset_root
+        self.lower = lower
+        self.max_tokens = max_tokens
+        print(f"Dataset initialization started: {self.dataset_name}.")
+
+    def _default_dataset_root(self) -> str:
+        fscratch_root = os.environ.get("ALT_WAVES_DATA_ROOT")
+        if fscratch_root:
+            return fscratch_root
+        return os.path.join(os.path.expanduser("~"), "fscratch", "datasets", "alt_waves")
 
     def make_dataset(self) -> tuple[list[tuple[str, str]], list[tuple[str, str]], list[tuple[str, str]]]:
-        dataset_dir = os.path.join(os.getcwd(), 'dataset', 'multi30k')
-        
-        if self.ext == ('de', 'en'):
-            src_lang, tgt_lang = 'de', 'en'
-        elif self.ext == ('en', 'de'):
-            src_lang, tgt_lang = 'en', 'de'
+        if self.dataset_name == "multi30k":
+            dataset_dir = os.path.join(os.getcwd(), 'dataset', 'multi30k')
+            if self.ext == ('de', 'en'):
+                src_lang, tgt_lang = 'de', 'en'
+            elif self.ext == ('en', 'de'):
+                src_lang, tgt_lang = 'en', 'de'
+            else:
+                raise ValueError(f"Invalid language extension: {self.ext}")
+            source_tokenizer = self.tokenize_de if src_lang == "de" else self.tokenize_en
+            target_tokenizer = self.tokenize_de if tgt_lang == "de" else self.tokenize_en
+            lower = True if self.lower is None else self.lower
         else:
-            raise ValueError(f"Invalid language extension: {self.ext}")
-        
+            dataset_base = self.dataset_root or self._default_dataset_root()
+            dataset_dir = os.path.join(dataset_base, self.dataset_name)
+            src_lang, tgt_lang = "src", "trg"
+            if self.tokenize_src is None or self.tokenize_tgt is None:
+                raise ValueError("Structured datasets require explicit source and target tokenizers.")
+            source_tokenizer = self.tokenize_src
+            target_tokenizer = self.tokenize_tgt
+            lower = False if self.lower is None else self.lower
+
         train_src_path = os.path.join(dataset_dir, f'train.{src_lang}')
         train_tgt_path = os.path.join(dataset_dir, f'train.{tgt_lang}')
         val_src_path = os.path.join(dataset_dir, f'val.{src_lang}')
@@ -123,12 +169,20 @@ class DataLoader:
             print(f"Dataset directory: {dataset_dir}")
             raise
         
-        if self.ext == ('de', 'en'):
-            self.source = VocabTransform(self.tokenize_de, self.init_token, self.eos_token)
-            self.target = VocabTransform(self.tokenize_en, self.init_token, self.eos_token)
-        elif self.ext == ('en', 'de'):
-            self.source = VocabTransform(self.tokenize_en, self.init_token, self.eos_token)
-            self.target = VocabTransform(self.tokenize_de, self.init_token, self.eos_token)
+        self.source = VocabTransform(
+            source_tokenizer,
+            self.init_token,
+            self.eos_token,
+            lower=lower,
+            max_tokens=self.max_tokens,
+        )
+        self.target = VocabTransform(
+            target_tokenizer,
+            self.init_token,
+            self.eos_token,
+            lower=lower,
+            max_tokens=self.max_tokens,
+        )
             
         self.source.is_source = True
         self.target.is_source = False
